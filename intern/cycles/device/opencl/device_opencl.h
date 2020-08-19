@@ -279,7 +279,7 @@ class OpenCLDevice : public Device {
                   const string &kernel_name,
                   const string &kernel_build_options,
                   bool use_stdout = true);
-    ~OpenCLProgram();
+    virtual ~OpenCLProgram();
 
     void add_kernel(ustring name);
 
@@ -456,7 +456,7 @@ class OpenCLDevice : public Device {
   void update_adaptive(DeviceTask &task, RenderTile &tile, int sample);
   void bake(DeviceTask &task, RenderTile &tile);
 
-  void denoise(RenderTile &tile, DenoisingTask &denoising);
+  virtual void denoise(RenderTile &tile, DenoisingTask &denoising);
 
   int get_split_task_count(DeviceTask & /*task*/)
   {
@@ -481,7 +481,7 @@ class OpenCLDevice : public Device {
     task_pool.cancel();
   }
 
-  void thread_run(DeviceTask &task);
+  virtual void thread_run(DeviceTask &task);
 
   virtual BVHLayoutMask get_bvh_layout_mask() const
   {

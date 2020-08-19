@@ -319,3 +319,77 @@ __kernel void kernel_ocl_filter_finalize(ccl_global float *buffer,
 		                       buffer_params, sample);
 	}
 }
+
+__kernel void kernel_ocl_filter_split_aov(ccl_global float *buffer,
+                                          int pixel_stride,
+                                          int row_stride,
+                                          ccl_global float *color,
+                                          int color_offset,
+                                          ccl_global float *albedo,
+                                          int albedo_offset,
+                                          ccl_global float *normals,
+                                          int normals_offset,
+                                          ccl_global float *depth,
+                                          int depth_offset,
+                                          int w, int h,
+                                          float scale,
+					  int color_only)
+{
+	int x = get_global_id(0);
+	int y = get_global_id(1);
+
+	ccl_global float *in = 0;
+	ccl_global float *out = 0;
+
+	if(x < w && y < h) {
+		in = buffer + color_offset + y * row_stride;
+		out = color + y * w * 3;
+		for (int e = 0; e < 3; e++) {
+			out[x * 3 + e] = in[x * pixel_stride + e];
+		}
+
+		if (color_only) {
+			return;
+		}
+
+		in = buffer + albedo_offset + y * row_stride;
+		out = albedo + y * w * 3;
+		for (int e = 0; e < 3; e++) {
+			out[x * 3 + e] = in[x * pixel_stride + e] * scale;
+		}
+
+		in = buffer + normals_offset + y * row_stride;
+		out = normals + y * w * 3;
+		for (int e = 0; e < 3; e++) {
+			out[x * 3 + e] = in[x * pixel_stride + e] * scale;
+		}
+
+		in = buffer + depth_offset + y * row_stride;
+		out = depth + y * w;
+		out[x] = in[x * pixel_stride];
+	}
+}
+
+__kernel void kernel_ocl_filter_write_color(ccl_global float *src,
+                                            int pass_stride,
+                                            int target_offset,
+                                            int target_stride,
+                                            ccl_global float *dst,
+                                            int w,
+                                            int xmin,
+                                            int xmax,
+                                            int ymin,
+                                            int ymax,
+                                            float invscale)
+{
+	int x = xmin + get_global_id(0);
+	int y = ymin + get_global_id(1);
+
+	if(x < xmax && y < ymax) {
+		ccl_global float *in = src + y * w * 3;
+		ccl_global float *out = dst + pass_stride * target_offset + y * pass_stride * target_stride;
+		for (int e = 0; e < 3; e++) {
+			out[pass_stride * x + e] = in[3 * (x - xmin) + e] * invscale;
+		}
+	}
+}
