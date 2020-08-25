@@ -333,7 +333,7 @@ __kernel void kernel_ocl_filter_split_aov(ccl_global float *buffer,
                                           int depth_offset,
                                           int w, int h,
                                           float scale,
-					  int color_only)
+                                          int color_only)
 {
 	int x = get_global_id(0);
 	int y = get_global_id(1);
@@ -342,31 +342,36 @@ __kernel void kernel_ocl_filter_split_aov(ccl_global float *buffer,
 	ccl_global float *out = 0;
 
 	if(x < w && y < h) {
-		in = buffer + color_offset + y * row_stride;
-		out = color + y * w * 3;
-		for (int e = 0; e < 3; e++) {
-			out[x * 3 + e] = in[x * pixel_stride + e];
-		}
+		int input_offset = x * pixel_stride + y * row_stride;
+		int output_offset = x * 3 + y * w * 3;
+
+		in = buffer + color_offset + input_offset;
+		out = color + output_offset;
+		out[0] = in[0];
+		out[1] = in[1];
+		out[2] = in[2];
 
 		if (color_only) {
 			return;
 		}
 
-		in = buffer + albedo_offset + y * row_stride;
-		out = albedo + y * w * 3;
-		for (int e = 0; e < 3; e++) {
-			out[x * 3 + e] = in[x * pixel_stride + e] * scale;
-		}
+		in = buffer + albedo_offset + input_offset;
+		out = albedo + output_offset;
+		out[0] = in[0] * scale;
+		out[1] = in[1] * scale;
+		out[2] = in[2] * scale;
 
-		in = buffer + normals_offset + y * row_stride;
-		out = normals + y * w * 3;
-		for (int e = 0; e < 3; e++) {
-			out[x * 3 + e] = in[x * pixel_stride + e] * scale;
-		}
+		in = buffer + normals_offset + input_offset;
+		out = normals + output_offset;
+		float3 normal = (float3)(in[0], in[1], in[2]);
+		normal = normalize(normal * scale);
+		out[0] = normal.x;
+		out[1] = normal.y;
+		out[2] = normal.z;
 
-		in = buffer + depth_offset + y * row_stride;
-		out = depth + y * w;
-		out[x] = in[x * pixel_stride];
+		in = buffer + depth_offset + input_offset;
+		out = depth + x + y * w;
+		out[0] = in[0];
 	}
 }
 
@@ -387,7 +392,7 @@ __kernel void kernel_ocl_filter_write_color(ccl_global float *src,
 
 	if(x < xmax && y < ymax) {
 		ccl_global float *in = src + y * w * 3;
-		ccl_global float *out = dst + pass_stride * target_offset + y * pass_stride * target_stride;
+		ccl_global float *out = dst + pass_stride * target_offset + (y - ymin) * pass_stride * target_stride;
 		for (int e = 0; e < 3; e++) {
 			out[pass_stride * x + e] = in[3 * (x - xmin) + e] * invscale;
 		}

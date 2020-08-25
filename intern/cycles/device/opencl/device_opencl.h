@@ -279,7 +279,7 @@ class OpenCLDevice : public Device {
                   const string &kernel_name,
                   const string &kernel_build_options,
                   bool use_stdout = true);
-    virtual ~OpenCLProgram();
+    ~OpenCLProgram();
 
     void add_kernel(ustring name);
 
@@ -397,7 +397,7 @@ class OpenCLDevice : public Device {
   void opencl_assert_err(cl_int err, const char *where);
 
   OpenCLDevice(DeviceInfo &info, Stats &stats, Profiler &profiler, bool background);
-  ~OpenCLDevice();
+  virtual ~OpenCLDevice();
 
   static void CL_CALLBACK context_notify_callback(const char *err_info,
                                                   const void * /*private_info*/,
@@ -456,7 +456,7 @@ class OpenCLDevice : public Device {
   void update_adaptive(DeviceTask &task, RenderTile &tile, int sample);
   void bake(DeviceTask &task, RenderTile &tile);
 
-  virtual void denoise(RenderTile &tile, DenoisingTask &denoising);
+  void denoise(RenderTile &tile, DenoisingTask &denoising);
 
   int get_split_task_count(DeviceTask & /*task*/)
   {

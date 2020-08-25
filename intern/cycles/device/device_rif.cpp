@@ -72,11 +72,36 @@ class RIFDevice : public OpenCLDevice {
   // Use a pool with multiple threads to support launches with multiple OpenCL queues
   TaskPool task_pool;
 
-  rif_context context = nullptr;
-  rif_command_queue queue = nullptr;
-  rif_image_filter denoise_filter = nullptr;
-  rif_image_filter remap_normal_filter = nullptr;
-  rif_image_filter remap_depth_filter = nullptr;
+  template<typename T> class rif_object {
+   private:
+    T object = nullptr;
+    rif_object(const rif_object &) = delete;             // non construction-copyable
+    rif_object &operator=(const rif_object &) = delete;  // non copyable
+   public:
+    rif_object() = default;
+
+    ~rif_object()
+    {
+      if (object)
+        rifObjectDelete(object);
+    }
+
+    operator T()
+    {
+      return object;
+    }
+
+    T *operator&()
+    {
+      return &object;
+    }
+  };
+
+  rif_object<rif_context> context;
+  rif_object<rif_command_queue> queue;
+  rif_object<rif_image_filter> denoise_filter;
+  rif_object<rif_image_filter> remap_normal_filter;
+  rif_object<rif_image_filter> remap_depth_filter;
 
   OpenCLProgram denoising_program;
 
@@ -125,25 +150,6 @@ class RIFDevice : public OpenCLDevice {
     denoising_program.add_kernel(ustring("filter_split_aov"));
     if (!denoising_program.load()) {
       denoising_program.compile();
-    }
-  }
-
-  ~RIFDevice()
-  {
-    if (denoise_filter) {
-      rifObjectDelete(denoise_filter);
-    }
-    if (remap_normal_filter) {
-      rifObjectDelete(remap_normal_filter);
-    }
-    if (remap_depth_filter) {
-      rifObjectDelete(remap_depth_filter);
-    }
-    if (queue) {
-      rifObjectDelete(queue);
-    }
-    if (context) {
-      rifObjectDelete(context);
     }
   }
 
@@ -229,7 +235,7 @@ class RIFDevice : public OpenCLDevice {
                    const size_t pass_stride)
   {
     /* Adjacent tiles are in separate memory regions, copy into single buffer. */
-    merged.resize(rect_size.x * rect_size.y * task.pass_stride);
+    merged.resize(size_t(rect_size.x * rect_size.y * task.pass_stride));
 
     //for (int i = 0; i < RenderTileNeighbors::SIZE; i++)
     {
@@ -245,8 +251,8 @@ class RIFDevice : public OpenCLDevice {
       const int xmax = min(ntile.x + ntile.w, rect.z);
       const int ymax = min(ntile.y + ntile.h, rect.w);
 
-      const size_t tile_offset = ntile.offset + xmin + ymin * ntile.stride;
-      const float *tile_buffer = (float *)ntile.buffers->buffer.host_pointer+ tile_offset * pass_stride;
+      const size_t tile_offset = size_t(ntile.offset + xmin + ymin * ntile.stride);
+      const float *tile_buffer = (float *)ntile.buffers->buffer.host_pointer + tile_offset * pass_stride;
 
       const size_t merged_stride = rect_size.x;
       const size_t merged_offset = (xmin - rect.x) + (ymin - rect.y) * merged_stride;
@@ -271,13 +277,13 @@ class RIFDevice : public OpenCLDevice {
                  const int w,
                  const int h,
                  const float scale,
+                 const int color_only,
                  device_vector<float> &color,
                  device_vector<float> &albedo,
                  device_vector<float> &normals,
                  device_vector<float> &depth)
   {
     /* Set images with appropriate stride for our interleaved pass storage. */
-    const int color_only = task.denoising.input_passes < DENOISER_INPUT_RGB_ALBEDO_NORMAL;
     const int pixel_offset = offset + x + y * stride;
     const int pixel_stride = task.pass_stride;
     const int row_stride = stride * pixel_stride;
@@ -317,8 +323,9 @@ class RIFDevice : public OpenCLDevice {
         continue;
       }
 
-      float *host_pointer = passes[i].vector.alloc(w * passes[i].num_elements, h, 1);
-#if 0
+      passes[i].vector.alloc(w * passes[i].num_elements, h, 1);
+#  if 0
+      float *host_pointer = (float*)passes[i].vector.host_pointer;
       if (passes[i].scale && scale != 1.0f) {
         /* Normalize albedo and normal passes as they are scaled by the number of samples.
          * For the color passes OIDN will perform auto-exposure making it unnecessary. */
@@ -393,14 +400,18 @@ class RIFDevice : public OpenCLDevice {
       /* Calculate size of the tile to denoise (including overlap). The overlap
        * size was chosen empirically. OpenImageDenoise specifies an overlap size
        * of 128 but this is significantly bigger than typical tile size. */
-      int4 rect = center_tile.bounds();      //rect_clip(rect_expand(center_tile.bounds(), 64), neighbors.bounds());
+      int4 rect = center_tile.bounds();  // rect_clip(rect_expand(center_tile.bounds(), 64),
+                                         // neighbors.bounds());
       const int2 rect_size = make_int2(rect.z - rect.x, rect.w - rect.y);
 
       array<float> merged;
       merge_tiles(task, scale, neighbors, merged, rect, rect_size, pass_stride);
 
+      const int color_only = task.denoising.input_passes < DENOISER_INPUT_RGB_ALBEDO_NORMAL;
+
       device_vector<float> color(this, "color buffer", MemoryType::MEM_READ_WRITE);
       device_vector<float> albedo(this, "albedo buffer", MemoryType::MEM_READ_WRITE);
+      /* TODO: map normals from 3 to 2 components*/
       device_vector<float> normals(this, "normals buffer", MemoryType::MEM_READ_WRITE);
       device_vector<float> depth(this, "depth buffer", MemoryType::MEM_READ_WRITE);
       split_aov(task,
@@ -412,6 +423,7 @@ class RIFDevice : public OpenCLDevice {
                 rect_size.x,
                 rect_size.y,
                 1.0f,
+                color_only,
                 color,
                 albedo,
                 normals,
@@ -426,48 +438,69 @@ class RIFDevice : public OpenCLDevice {
       desc.type = RIF_COMPONENT_TYPE_FLOAT32;
 
       device_vector<float> output(this, "output buffer", MemoryType::MEM_READ_WRITE);
-      output.alloc(desc.image_width * desc.num_components, desc.image_height, desc.image_depth);
+      output.alloc(size_t(desc.image_width * desc.num_components),
+                   size_t(desc.image_height),
+                   size_t(desc.image_depth));
       output.copy_to_device();
 
-      rif_image output_img = nullptr;
+      rif_object<rif_image> output_img;
       check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
           context, &desc, CL_MEM_PTR(output.device_pointer), &output_img));
 
-      rif_image color_img = nullptr;
+      rif_object<rif_image> color_img;
       check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
           context, &desc, CL_MEM_PTR(color.device_pointer), &color_img));
 
-      rif_image albedo_img = nullptr;
-      check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
-          context, &desc, CL_MEM_PTR(albedo.device_pointer), &albedo_img));
+      rif_object<rif_image> albedo_img;
+      if (!color_only) {
+        check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
+            context, &desc, CL_MEM_PTR(albedo.device_pointer), &albedo_img));
+      }
 
-      rif_image normals_img = nullptr;
-      check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
-          context, &desc, CL_MEM_PTR(normals.device_pointer), &normals_img));
-      check_result_rif_ret(
-          rifCommandQueueAttachImageFilter(queue, remap_normal_filter, normals_img, normals_img));
+      rif_object<rif_image> normals_img;
+      if (!color_only) {
+        check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
+            context, &desc, CL_MEM_PTR(normals.device_pointer), &normals_img));
+        check_result_rif_ret(rifCommandQueueAttachImageFilter(
+            queue, remap_normal_filter, normals_img, normals_img));
+      }
 
       desc.num_components = 1;
-      rif_image depth_img = nullptr;
-      check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
-          context, &desc, CL_MEM_PTR(depth.device_pointer), &depth_img));
-      check_result_rif_ret(
-          rifCommandQueueAttachImageFilter(queue, remap_depth_filter, depth_img, depth_img));
+      rif_object<rif_image> depth_img;
+      if (!color_only) {
+        check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
+            context, &desc, CL_MEM_PTR(depth.device_pointer), &depth_img));
+        check_result_rif_ret(
+            rifCommandQueueAttachImageFilter(queue, remap_depth_filter, depth_img, depth_img));
+      }
 
       check_result_rif_ret(rifImageFilterSetParameterImage(denoise_filter, "colorImg", color_img));
-      check_result_rif_ret(
-          rifImageFilterSetParameterImage(denoise_filter, "albedoImg", albedo_img));
-      check_result_rif_ret(
-          rifImageFilterSetParameterImage(denoise_filter, "normalsImg", normals_img));
-      check_result_rif_ret(rifImageFilterSetParameterImage(denoise_filter, "depthImg", depth_img));
+      if (color_only) {
+        check_result_rif_ret(
+            rifImageFilterClearParameterImage(denoise_filter, "albedoImg"));
+        check_result_rif_ret(
+            rifImageFilterClearParameterImage(denoise_filter, "normalsImg"));
+        check_result_rif_ret(
+            rifImageFilterClearParameterImage(denoise_filter, "depthImg"));
+      }
+      else {
+        check_result_rif_ret(
+            rifImageFilterSetParameterImage(denoise_filter, "albedoImg", albedo_img));
+        check_result_rif_ret(
+            rifImageFilterSetParameterImage(denoise_filter, "normalsImg", normals_img));
+        check_result_rif_ret(
+            rifImageFilterSetParameterImage(denoise_filter, "depthImg", depth_img));
+      }
 
       check_result_rif_ret(
           rifCommandQueueAttachImageFilter(queue, denoise_filter, color_img, output_img));
       check_result_rif_ret(rifContextExecuteCommandQueue(context, queue, nullptr, nullptr, nullptr));
       check_result_rif_ret(rifCommandQueueDetachImageFilter(queue, denoise_filter));
-      check_result_rif_ret(rifCommandQueueDetachImageFilter(queue, remap_normal_filter));
-      check_result_rif_ret(rifCommandQueueDetachImageFilter(queue, remap_depth_filter));
 
+      if (!color_only) {
+        check_result_rif_ret(rifCommandQueueDetachImageFilter(queue, remap_normal_filter));
+        check_result_rif_ret(rifCommandQueueDetachImageFilter(queue, remap_depth_filter));
+      }
       /* Copy back result from merged buffer. */
       RenderTile &target = neighbors.target;
       const int xmin = max(target.x, rect.x);
@@ -495,7 +528,7 @@ class RIFDevice : public OpenCLDevice {
 
       for (int y = ymin; y < ymax; y++) {
         float *target_row = target_data + pass_stride * target.offset + y * pass_stride * target.stride;
-        const float *data_row = data + y * rect_size.x * 3;
+        const float *data_row = data + (y - ymin) * rect_size.x * 3;
 
         for (int x = xmin; x < xmax; x++) {
           target_row[pass_stride * x + 0] = data_row[3 * (x - xmin) + 0] * invscale;
@@ -507,8 +540,7 @@ class RIFDevice : public OpenCLDevice {
           clEnqueueUnmapMemObject(cqCommandQueue, target_mem, target_data, 0, nullptr, nullptr));
 
       check_result_rif_ret(rifImageUnmap(output_img, data));
-#endif
-#  if 1
+#else
       cl_kernel filter_write_color = denoising_program(ustring("filter_write_color"));
 
       int arg_ofs = 0;
@@ -522,16 +554,8 @@ class RIFDevice : public OpenCLDevice {
       arg_ofs += kernel_set_args(filter_write_color, arg_ofs, target.buffer, rect_size.x);
       arg_ofs += kernel_set_args(filter_write_color, arg_ofs, xmin, xmax, ymin, ymax, invscale);
 
-      enqueue_kernel(filter_write_color, xmax - xmin, ymax - ymin);
+      enqueue_kernel(filter_write_color, size_t(xmax - xmin), size_t(ymax - ymin));
 #  endif
-
-      /// TODO: wrap with auto-release object
-      rifObjectDelete(output_img);
-      rifObjectDelete(color_img);
-      rifObjectDelete(albedo_img);
-      rifObjectDelete(normals_img);
-      rifObjectDelete(depth_img);
-
       task.unmap_neighbor_tiles(neighbors, this);
     }
     else {
