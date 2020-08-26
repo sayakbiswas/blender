@@ -391,8 +391,8 @@ __kernel void kernel_ocl_filter_write_color(ccl_global float *src,
 	int y = ymin + get_global_id(1);
 
 	if(x < xmax && y < ymax) {
-		ccl_global float *in = src + y * w * 3;
-		ccl_global float *out = dst + pass_stride * target_offset + (y - ymin) * pass_stride * target_stride;
+		ccl_global float *in = src + (y - ymin) * w * 3;
+		ccl_global float *out = dst + pass_stride * target_offset + y * pass_stride * target_stride;
 		for (int e = 0; e < 3; e++) {
 			out[pass_stride * x + e] = in[3 * (x - xmin) + e] * invscale;
 		}
