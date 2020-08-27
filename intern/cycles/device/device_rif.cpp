@@ -188,9 +188,7 @@ class RIFDevice : public OpenCLDevice {
           bake(task, tile);
         }
         else if (tile.task == RenderTile::DENOISE) {
-          tile.sample = tile.start_sample + tile.num_samples;
           launch_denoise(task, tile, denoising);
-          task.update_progress(&tile, tile.w * tile.h);
         }
 
         task.release_tile(tile);
@@ -237,12 +235,12 @@ class RIFDevice : public OpenCLDevice {
     /* Adjacent tiles are in separate memory regions, copy into single buffer. */
     merged.resize(size_t(rect_size.x * rect_size.y * task.pass_stride));
 
-    //for (int i = 0; i < RenderTileNeighbors::SIZE; i++)
+    for (int i = 0; i < RenderTileNeighbors::SIZE; i++)
     {
-      RenderTile &ntile = neighbors.tiles[RenderTileNeighbors::CENTER];
-      //if (!ntile.buffer) {
-      //  continue;
-      //}
+      RenderTile &ntile = neighbors.tiles[i/*RenderTileNeighbors::CENTER*/];
+      if (!ntile.buffer) {
+        continue;
+      }
 
       ntile.buffers->copy_from_device();
 
@@ -400,8 +398,8 @@ class RIFDevice : public OpenCLDevice {
       /* Calculate size of the tile to denoise (including overlap). The overlap
        * size was chosen empirically. OpenImageDenoise specifies an overlap size
        * of 128 but this is significantly bigger than typical tile size. */
-      int4 rect = center_tile.bounds();  // rect_clip(rect_expand(center_tile.bounds(), 64),
-                                         // neighbors.bounds());
+      const int overlap = 32;
+      int4 rect = rect_clip(rect_expand(center_tile.bounds(), overlap), neighbors.bounds());
       const int2 rect_size = make_int2(rect.z - rect.x, rect.w - rect.y);
 
       array<float> merged;
@@ -411,7 +409,6 @@ class RIFDevice : public OpenCLDevice {
 
       device_vector<float> color(this, "color buffer", MemoryType::MEM_READ_WRITE);
       device_vector<float> albedo(this, "albedo buffer", MemoryType::MEM_READ_WRITE);
-      /* TODO: map normals from 3 to 2 components*/
       device_vector<float> normals(this, "normals buffer", MemoryType::MEM_READ_WRITE);
       device_vector<float> depth(this, "depth buffer", MemoryType::MEM_READ_WRITE);
       split_aov(task,
@@ -507,6 +504,8 @@ class RIFDevice : public OpenCLDevice {
       const int ymin = max(target.y, rect.y);
       const int xmax = min(target.x + target.w, rect.z);
       const int ymax = min(target.y + target.h, rect.w);
+      const int overlap_x = min(overlap, target.x);
+      const int overlap_y = min(overlap, target.y);
 
 #  if 0
       float *data = nullptr;
@@ -528,12 +527,12 @@ class RIFDevice : public OpenCLDevice {
 
       for (int y = ymin; y < ymax; y++) {
         float *target_row = target_data + pass_stride * target.offset + y * pass_stride * target.stride;
-        const float *data_row = data + (y - ymin) * rect_size.x * 3;
+        const float *data_row = data + (y - ymin + overlap_y) * rect_size.x * 3;
 
         for (int x = xmin; x < xmax; x++) {
-          target_row[pass_stride * x + 0] = data_row[3 * (x - xmin) + 0] * invscale;
-          target_row[pass_stride * x + 1] = data_row[3 * (x - xmin) + 1] * invscale;
-          target_row[pass_stride * x + 2] = data_row[3 * (x - xmin) + 2] * invscale;
+          target_row[pass_stride * x + 0] = data_row[3 * (x - xmin + overlap_x) + 0] * invscale;
+          target_row[pass_stride * x + 1] = data_row[3 * (x - xmin + overlap_x) + 1] * invscale;
+          target_row[pass_stride * x + 2] = data_row[3 * (x - xmin + overlap_x) + 2] * invscale;
         }
       }
       opencl_assert(
@@ -551,7 +550,7 @@ class RIFDevice : public OpenCLDevice {
                                  target.offset,
                                  target.stride);
 
-      arg_ofs += kernel_set_args(filter_write_color, arg_ofs, target.buffer, rect_size.x);
+      arg_ofs += kernel_set_args(filter_write_color, arg_ofs, target.buffer, rect_size.x, overlap_x, overlap_y);
       arg_ofs += kernel_set_args(filter_write_color, arg_ofs, xmin, xmax, ymin, ymax, invscale);
 
       enqueue_kernel(filter_write_color, size_t(xmax - xmin), size_t(ymax - ymin));
