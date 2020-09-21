@@ -320,6 +320,26 @@ __kernel void kernel_ocl_filter_finalize(ccl_global float *buffer,
 	}
 }
 
+__kernel void kernel_ocl_filter_copy_input(ccl_global float *buffer,
+                                           CCL_FILTER_TILE_INFO,
+                                           int4 prefilter_rect,
+                                           int buffer_pass_stride)
+{
+	int x = prefilter_rect.x + get_global_id(0);
+	int y = prefilter_rect.y + get_global_id(1);
+	if(x < prefilter_rect.z && y < prefilter_rect.w) {
+		int xtile = (x < tile_info->x[1]) ? 0 : ((x < tile_info->x[2]) ? 1 : 2);
+		int ytile = (y < tile_info->y[1]) ? 0 : ((y < tile_info->y[2]) ? 1 : 2);
+		int itile = ytile * 3 + xtile;
+		ccl_global float *in = ((ccl_global float *)ccl_get_tile_buffer(itile)) +
+			(tile_info->offsets[itile] + y * tile_info->strides[itile] + x) * buffer_pass_stride;
+		buffer += ((y - prefilter_rect.y) * (prefilter_rect.z - prefilter_rect.x) + (x - prefilter_rect.x)) * buffer_pass_stride;
+		for (int i = 0; i < buffer_pass_stride; ++i)
+			buffer[i] = in[i];
+	}
+}
+
+
 __kernel void kernel_ocl_filter_split_aov(ccl_global float *buffer,
                                           int pixel_stride,
                                           int row_stride,
@@ -347,9 +367,9 @@ __kernel void kernel_ocl_filter_split_aov(ccl_global float *buffer,
 
 		in = buffer + color_offset + input_offset;
 		out = color + output_offset;
-		out[0] = in[0];
-		out[1] = in[1];
-		out[2] = in[2];
+		out[0] = in[0] * scale;
+		out[1] = in[1] * scale;
+		out[2] = in[2] * scale;
 
 		if (color_only) {
 			return;
@@ -371,7 +391,7 @@ __kernel void kernel_ocl_filter_split_aov(ccl_global float *buffer,
 
 		in = buffer + depth_offset + input_offset;
 		out = depth + x + y * w;
-		out[0] = in[0];
+		out[0] = in[0] * scale;
 	}
 }
 

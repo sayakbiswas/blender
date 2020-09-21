@@ -119,6 +119,9 @@ class DebugFlags {
 
     /* Reset flags to their defaults. */
     void reset();
+
+    /* Use only color components for denoising. */
+    bool color_only;
   };
 
   /* Descriptor of OpenCL feature-set to be used. */

@@ -1,6 +1,5 @@
 /*
- * Copyright 2019, NVIDIA Corporation.
- * Copyright 2019, Blender Foundation.
+ * Copyright 2020, Blender Foundation.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -109,8 +108,6 @@ class RIFDevice : public OpenCLDevice {
   RIFDevice(DeviceInfo &info, Stats &stats, Profiler &profiler, bool background)
       : OpenCLDevice(info, stats, profiler, background)
   {
-    // info.= DebugFlags().rif.;
-
     if (!cxContext) {
       return;  // Do not initialize if OpenCL context creation failed already
     }
@@ -148,6 +145,7 @@ class RIFDevice : public OpenCLDevice {
 
     denoising_program.add_kernel(ustring("filter_write_color"));
     denoising_program.add_kernel(ustring("filter_split_aov"));
+    denoising_program.add_kernel(ustring("filter_copy_input"));
     if (!denoising_program.load()) {
       denoising_program.compile();
     }
@@ -155,23 +153,15 @@ class RIFDevice : public OpenCLDevice {
 
   void thread_run(DeviceTask &task) override
   {
-    flush_texture_buffers();
-
     if (task.type == DeviceTask::RENDER) {
       RenderTile tile;
       DenoisingTask denoising(this, task);
-
-      /* Allocate buffer for kernel globals */
-      //device_only_memory<KernelGlobalsDummy> kgbuffer(this, "kernel_globals");
-      //kgbuffer.alloc_to_device(1);
 
       /* Keep rendering tiles until done. */
       while (task.acquire_tile(this, tile, task.tile_types)) {
         if (tile.task == RenderTile::PATH_TRACE) {
           assert(tile.task == RenderTile::PATH_TRACE);
           scoped_timer timer(&tile.buffers->render_time);
-
-          //split_kernel->path_trace(task, tile, kgbuffer, *const_mem_map["__data"]);
 
           /* Complete kernel execution before release tile. */
           /* This helps in multi-device render;
@@ -193,8 +183,6 @@ class RIFDevice : public OpenCLDevice {
 
         task.release_tile(tile);
       }
-
-      //kgbuffer.free();
     }
     else if (task.type == DeviceTask::SHADER) {
       shader(task);
@@ -227,47 +215,44 @@ class RIFDevice : public OpenCLDevice {
   void merge_tiles(DeviceTask &task,
                    const float scale,
                    RenderTileNeighbors &neighbors,
-                   array<float> &merged,
+                   device_only_memory<float> &merged,
                    const int4 &rect,
                    const int2 &rect_size,
                    const size_t pass_stride)
   {
-    /* Adjacent tiles are in separate memory regions, copy into single buffer. */
-    merged.resize(size_t(rect_size.x * rect_size.y * task.pass_stride));
+    device_vector<TileInfo> tile_info_mem(this, "denoiser tile info", MEM_READ_WRITE);
 
-    for (int i = 0; i < RenderTileNeighbors::SIZE; i++)
-    {
-      RenderTile &ntile = neighbors.tiles[i/*RenderTileNeighbors::CENTER*/];
-      if (!ntile.buffer) {
-        continue;
-      }
-
-      ntile.buffers->copy_from_device();
-
-      const int xmin = max(ntile.x, rect.x);
-      const int ymin = max(ntile.y, rect.y);
-      const int xmax = min(ntile.x + ntile.w, rect.z);
-      const int ymax = min(ntile.y + ntile.h, rect.w);
-
-      const size_t tile_offset = size_t(ntile.offset + xmin + ymin * ntile.stride);
-      const float *tile_buffer = (float *)ntile.buffers->buffer.host_pointer + tile_offset * pass_stride;
-
-      const size_t merged_stride = rect_size.x;
-      const size_t merged_offset = (xmin - rect.x) + (ymin - rect.y) * merged_stride;
-      float *merged_buffer = merged.data() + merged_offset * pass_stride;
-
-      for (int y = ymin; y < ymax; y++) {
-        for (int x = 0; x < pass_stride * (xmax - xmin); x++) {
-          merged_buffer[x] = tile_buffer[x] * scale;
-        }
-        tile_buffer += ntile.stride * pass_stride;
-        merged_buffer += merged_stride * pass_stride;
-      }
+    TileInfo *tile_info = tile_info_mem.alloc(1);
+    for (int i = 0; i < RenderTileNeighbors::SIZE; i++) {
+      tile_info->offsets[i] = neighbors.tiles[i].offset;
+      tile_info->strides[i] = neighbors.tiles[i].stride;
+      tile_info->buffers[i] = neighbors.tiles[i].buffer;
     }
+    tile_info->x[0] = neighbors.tiles[3].x;
+    tile_info->x[1] = neighbors.tiles[4].x;
+    tile_info->x[2] = neighbors.tiles[5].x;
+    tile_info->x[3] = neighbors.tiles[5].x + neighbors.tiles[5].w;
+    tile_info->y[0] = neighbors.tiles[1].y;
+    tile_info->y[1] = neighbors.tiles[4].y;
+    tile_info->y[2] = neighbors.tiles[7].y;
+    tile_info->y[3] = neighbors.tiles[7].y + neighbors.tiles[7].h;
+    tile_info_mem.copy_to_device();
+
+    cl_kernel filter_copy_input = denoising_program(ustring("filter_copy_input"));
+
+    int arg_ofs = 0;
+    arg_ofs += kernel_set_args(
+        filter_copy_input, arg_ofs, merged.device_pointer, tile_info_mem.device_pointer);
+    for (int i = 0; i < RenderTileNeighbors::SIZE; i++) {
+      arg_ofs += kernel_set_args(filter_copy_input, arg_ofs, tile_info->buffers[i]);
+    }
+    arg_ofs += kernel_set_args(filter_copy_input, arg_ofs, (int4&)rect, task.pass_stride);
+
+    enqueue_kernel(filter_copy_input, rect_size.x, rect_size.y);
   }
 
   void split_aov(DeviceTask &task,
-                 array<float> &buffer,
+                 device_only_memory<float> &buffer,
                  const int offset,
                  const int stride,
                  const int x,
@@ -276,10 +261,10 @@ class RIFDevice : public OpenCLDevice {
                  const int h,
                  const float scale,
                  const int color_only,
-                 device_vector<float> &color,
-                 device_vector<float> &albedo,
-                 device_vector<float> &normals,
-                 device_vector<float> &depth)
+                 device_only_memory<float> &color,
+                 device_only_memory<float> &albedo,
+                 device_only_memory<float> &normals,
+                 device_only_memory<float> &depth)
   {
     /* Set images with appropriate stride for our interleaved pass storage. */
     const int pixel_offset = offset + x + y * stride;
@@ -287,32 +272,27 @@ class RIFDevice : public OpenCLDevice {
     const int row_stride = stride * pixel_stride;
 
     struct {
-      device_vector<float> &vector;
+      device_only_memory<float> &vector;
       const int num_elements;
       const int offset;
-      const bool scale;
       const bool use;
       array<float> scaled_buffer;
     } passes[] = {
         {color,
          3,
          pixel_offset * task.pass_stride + task.pass_denoising_data + DENOISING_PASS_COLOR,
-         false,
          true},
         {albedo,
          3,
          pixel_offset * task.pass_stride + task.pass_denoising_data + DENOISING_PASS_ALBEDO,
-         true,
          !color_only},
         {normals,
          3,
          pixel_offset * task.pass_stride + task.pass_denoising_data + DENOISING_PASS_NORMAL,
-         true,
          !color_only},
         {depth,
          1,
          pixel_offset * task.pass_stride + task.pass_denoising_data + DENOISING_PASS_DEPTH,
-         false,
          !color_only},
     };
 
@@ -321,49 +301,13 @@ class RIFDevice : public OpenCLDevice {
         continue;
       }
 
-      passes[i].vector.alloc(w * passes[i].num_elements, h, 1);
-#  if 0
-      float *host_pointer = (float*)passes[i].vector.host_pointer;
-      if (passes[i].scale && scale != 1.0f) {
-        /* Normalize albedo and normal passes as they are scaled by the number of samples.
-         * For the color passes OIDN will perform auto-exposure making it unnecessary. */
-
-        for (int y = 0; y < h; y++) {
-          const float *pass_row = buffer.data() + passes[i].offset + y * row_stride;
-          float *scaled_row = host_pointer + y * w * passes[i].num_elements;
-
-          for (int x = 0; x < w; x++) {
-            for (int e = 0; e < passes[i].num_elements; e++) {
-              scaled_row[x * passes[i].num_elements + e] = pass_row[x * pixel_stride + e] * scale;
-            }
-          }
-        }
-      }
-      else {
-        for (int y = 0; y < h; y++) {
-          const float *pass_row = buffer.data() + passes[i].offset + y * row_stride;
-          float *row = host_pointer + y * w * passes[i].num_elements;
-
-          for (int x = 0; x < w; x++) {
-            for (int e = 0; e < passes[i].num_elements; e++) {
-              row[x * passes[i].num_elements + e] = pass_row[x * pixel_stride + e];
-            }
-          }
-        }
-      }
-#endif
-      passes[i].vector.copy_to_device();
+      passes[i].vector.alloc_to_device(size_t(w) * h * passes[i].num_elements);
     }
-#if 1
-    device_vector<float> input(this, "tile data", MemoryType::MEM_READ_WRITE);
-    input.steal_data(buffer);
-    input.copy_to_device();
-
     cl_kernel filter_split_aov = denoising_program(ustring("filter_split_aov"));
 
     int arg_ofs = 0;
     arg_ofs += kernel_set_args(
-        filter_split_aov, arg_ofs, input.device_pointer, pixel_stride, row_stride);
+        filter_split_aov, arg_ofs, buffer.device_pointer, pixel_stride, row_stride);
     
     for (int i = 0; i < sizeof(passes) / sizeof(passes[0]); i++) {
       arg_ofs += kernel_set_args(
@@ -374,7 +318,116 @@ class RIFDevice : public OpenCLDevice {
         filter_split_aov, arg_ofs, w, h, scale, color_only);
 
     enqueue_kernel(filter_split_aov, w, h);
-#endif
+  }
+
+  bool copy_back(RenderTile &target,
+                 const int4 &rect,
+                 const int2 &rect_size,
+                 const int overlap,
+                 const float invscale,
+                 device_only_memory<float> &output,
+                 const int pass_stride)
+  {
+    /* Copy back result from merged buffer. */
+    const int xmin = max(target.x, rect.x);
+    const int ymin = max(target.y, rect.y);
+    const int xmax = min(target.x + target.w, rect.z);
+    const int ymax = min(target.y + target.h, rect.w);
+    const int overlap_x = min(overlap, target.x);
+    const int overlap_y = min(overlap, target.y);
+
+    cl_kernel filter_write_color = denoising_program(ustring("filter_write_color"));
+
+    int arg_ofs = 0;
+    arg_ofs += kernel_set_args(filter_write_color,
+                               arg_ofs,
+                               output.device_pointer,
+                               pass_stride,
+                               target.offset,
+                               target.stride);
+
+    arg_ofs += kernel_set_args(
+        filter_write_color, arg_ofs, target.buffer, rect_size.x, overlap_x, overlap_y);
+    arg_ofs += kernel_set_args(filter_write_color, arg_ofs, xmin, xmax, ymin, ymax, invscale);
+
+    enqueue_kernel(filter_write_color, size_t(xmax) - xmin, size_t(ymax) - ymin);
+
+    return true;
+  }
+
+  bool rif_denoise(const int2 &rect_size,
+                   const int color_only,
+                   device_only_memory<float> &color,
+                   device_only_memory<float> &albedo,
+                   device_only_memory<float> &normals,
+                   device_only_memory<float> &depth,
+                   device_only_memory<float> &output)
+  {
+    rif_image_desc desc = {0};
+
+    desc.image_width = rect_size.x;
+    desc.image_height = rect_size.y;
+    desc.image_depth = 1;
+    desc.num_components = 3;
+    desc.type = RIF_COMPONENT_TYPE_FLOAT32;
+
+    output.alloc_to_device(size_t(desc.image_width) * desc.num_components * desc.image_height *
+                           desc.image_depth);
+
+    rif_object<rif_image> output_img;
+    check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
+        context, &desc, CL_MEM_PTR(output.device_pointer), &output_img));
+
+    rif_object<rif_image> color_img;
+    check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
+        context, &desc, CL_MEM_PTR(color.device_pointer), &color_img));
+
+    rif_object<rif_image> albedo_img;
+    if (!color_only) {
+      check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
+          context, &desc, CL_MEM_PTR(albedo.device_pointer), &albedo_img));
+    }
+
+    rif_object<rif_image> normals_img;
+    if (!color_only) {
+      check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
+          context, &desc, CL_MEM_PTR(normals.device_pointer), &normals_img));
+      check_result_rif_ret(
+          rifCommandQueueAttachImageFilter(queue, remap_normal_filter, normals_img, normals_img));
+    }
+
+    desc.num_components = 1;
+    rif_object<rif_image> depth_img;
+    if (!color_only) {
+      check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
+          context, &desc, CL_MEM_PTR(depth.device_pointer), &depth_img));
+      check_result_rif_ret(
+          rifCommandQueueAttachImageFilter(queue, remap_depth_filter, depth_img, depth_img));
+    }
+
+    check_result_rif_ret(rifImageFilterSetParameterImage(denoise_filter, "colorImg", color_img));
+    if (color_only) {
+      check_result_rif_ret(rifImageFilterClearParameterImage(denoise_filter, "albedoImg"));
+      check_result_rif_ret(rifImageFilterClearParameterImage(denoise_filter, "normalsImg"));
+      check_result_rif_ret(rifImageFilterClearParameterImage(denoise_filter, "depthImg"));
+    }
+    else {
+      check_result_rif_ret(
+          rifImageFilterSetParameterImage(denoise_filter, "albedoImg", albedo_img));
+      check_result_rif_ret(
+          rifImageFilterSetParameterImage(denoise_filter, "normalsImg", normals_img));
+      check_result_rif_ret(rifImageFilterSetParameterImage(denoise_filter, "depthImg", depth_img));
+    }
+
+    check_result_rif_ret(
+        rifCommandQueueAttachImageFilter(queue, denoise_filter, color_img, output_img));
+    check_result_rif_ret(rifContextExecuteCommandQueue(context, queue, nullptr, nullptr, nullptr));
+    check_result_rif_ret(rifCommandQueueDetachImageFilter(queue, denoise_filter));
+
+    if (!color_only) {
+      check_result_rif_ret(rifCommandQueueDetachImageFilter(queue, remap_normal_filter));
+      check_result_rif_ret(rifCommandQueueDetachImageFilter(queue, remap_depth_filter));
+    }
   }
 
   bool launch_denoise(DeviceTask &task, RenderTile &rtile, DenoisingTask &denoising)
@@ -396,21 +449,25 @@ class RIFDevice : public OpenCLDevice {
       rtile = center_tile;
 
       /* Calculate size of the tile to denoise (including overlap). The overlap
-       * size was chosen empirically. OpenImageDenoise specifies an overlap size
-       * of 128 but this is significantly bigger than typical tile size. */
+       * size was chosen empirically. */
       const int overlap = 32;
-      int4 rect = rect_clip(rect_expand(center_tile.bounds(), overlap), neighbors.bounds());
+      const int4 rect = rect_clip(rect_expand(center_tile.bounds(), overlap), neighbors.bounds());
       const int2 rect_size = make_int2(rect.z - rect.x, rect.w - rect.y);
 
-      array<float> merged;
+      // Adjacent tiles are in separate memory regions, so need to copy them into a single one
+      device_only_memory<float> merged(this, "merged tiles buffer");
+      merged.alloc_to_device(size_t(rect_size.x) * rect_size.y * pass_stride);
       merge_tiles(task, scale, neighbors, merged, rect, rect_size, pass_stride);
 
-      const int color_only = task.denoising.input_passes < DENOISER_INPUT_RGB_ALBEDO_NORMAL;
+      const int color_only = task.denoising.input_passes < DENOISER_INPUT_RGB_ALBEDO_NORMAL ||
+                             DebugFlags().rif.color_only;
 
-      device_vector<float> color(this, "color buffer", MemoryType::MEM_READ_WRITE);
-      device_vector<float> albedo(this, "albedo buffer", MemoryType::MEM_READ_WRITE);
-      device_vector<float> normals(this, "normals buffer", MemoryType::MEM_READ_WRITE);
-      device_vector<float> depth(this, "depth buffer", MemoryType::MEM_READ_WRITE);
+      /* Once we have all the tiles in one memory buffer, we split it into separate OAVs: color,
+       * albedo, normals and depth. */
+      device_only_memory<float> color(this, "color buffer");
+      device_only_memory<float> albedo(this, "albedo buffer");
+      device_only_memory<float> normals(this, "normals buffer");
+      device_only_memory<float> depth(this, "depth buffer");
       split_aov(task,
                 merged,
                 0,
@@ -419,142 +476,20 @@ class RIFDevice : public OpenCLDevice {
                 0,
                 rect_size.x,
                 rect_size.y,
-                1.0f,
+                scale,
                 color_only,
                 color,
                 albedo,
                 normals,
                 depth);
 
-      rif_image_desc desc = {0};
+      /* Execute the denoiser. */
+      device_only_memory<float> output(this, "output buffer");
+      rif_denoise(rect_size, color_only, color, albedo, normals, depth, output);
 
-      desc.image_width = rect_size.x;
-      desc.image_height = rect_size.y;
-      desc.image_depth = 1;
-      desc.num_components = 3;
-      desc.type = RIF_COMPONENT_TYPE_FLOAT32;
+      /* Copy denoised image back to a target tile. */
+      copy_back(neighbors.target, rect, rect_size, overlap, invscale, output, pass_stride);
 
-      device_vector<float> output(this, "output buffer", MemoryType::MEM_READ_WRITE);
-      output.alloc(size_t(desc.image_width * desc.num_components),
-                   size_t(desc.image_height),
-                   size_t(desc.image_depth));
-      output.copy_to_device();
-
-      rif_object<rif_image> output_img;
-      check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
-          context, &desc, CL_MEM_PTR(output.device_pointer), &output_img));
-
-      rif_object<rif_image> color_img;
-      check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
-          context, &desc, CL_MEM_PTR(color.device_pointer), &color_img));
-
-      rif_object<rif_image> albedo_img;
-      if (!color_only) {
-        check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
-            context, &desc, CL_MEM_PTR(albedo.device_pointer), &albedo_img));
-      }
-
-      rif_object<rif_image> normals_img;
-      if (!color_only) {
-        check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
-            context, &desc, CL_MEM_PTR(normals.device_pointer), &normals_img));
-        check_result_rif_ret(rifCommandQueueAttachImageFilter(
-            queue, remap_normal_filter, normals_img, normals_img));
-      }
-
-      desc.num_components = 1;
-      rif_object<rif_image> depth_img;
-      if (!color_only) {
-        check_result_rif_ret(rifContextCreateImageFromOpenClMemory(
-            context, &desc, CL_MEM_PTR(depth.device_pointer), &depth_img));
-        check_result_rif_ret(
-            rifCommandQueueAttachImageFilter(queue, remap_depth_filter, depth_img, depth_img));
-      }
-
-      check_result_rif_ret(rifImageFilterSetParameterImage(denoise_filter, "colorImg", color_img));
-      if (color_only) {
-        check_result_rif_ret(
-            rifImageFilterClearParameterImage(denoise_filter, "albedoImg"));
-        check_result_rif_ret(
-            rifImageFilterClearParameterImage(denoise_filter, "normalsImg"));
-        check_result_rif_ret(
-            rifImageFilterClearParameterImage(denoise_filter, "depthImg"));
-      }
-      else {
-        check_result_rif_ret(
-            rifImageFilterSetParameterImage(denoise_filter, "albedoImg", albedo_img));
-        check_result_rif_ret(
-            rifImageFilterSetParameterImage(denoise_filter, "normalsImg", normals_img));
-        check_result_rif_ret(
-            rifImageFilterSetParameterImage(denoise_filter, "depthImg", depth_img));
-      }
-
-      check_result_rif_ret(
-          rifCommandQueueAttachImageFilter(queue, denoise_filter, color_img, output_img));
-      check_result_rif_ret(rifContextExecuteCommandQueue(context, queue, nullptr, nullptr, nullptr));
-      check_result_rif_ret(rifCommandQueueDetachImageFilter(queue, denoise_filter));
-
-      if (!color_only) {
-        check_result_rif_ret(rifCommandQueueDetachImageFilter(queue, remap_normal_filter));
-        check_result_rif_ret(rifCommandQueueDetachImageFilter(queue, remap_depth_filter));
-      }
-      /* Copy back result from merged buffer. */
-      RenderTile &target = neighbors.target;
-      const int xmin = max(target.x, rect.x);
-      const int ymin = max(target.y, rect.y);
-      const int xmax = min(target.x + target.w, rect.z);
-      const int ymax = min(target.y + target.h, rect.w);
-      const int overlap_x = min(overlap, target.x);
-      const int overlap_y = min(overlap, target.y);
-
-#  if 0
-      float *data = nullptr;
-      check_result_rif_ret(rifImageMap(output_img, RIF_IMAGE_MAP_READ, (void **)&data));
-
-      cl_mem target_mem = CL_MEM_PTR(target.buffer);
-      cl_int result;
-      float *target_data = (float *)clEnqueueMapBuffer(cqCommandQueue,
-                                                       target_mem,
-                                                       CL_TRUE,
-                                                       CL_MAP_WRITE,
-                                                       0,
-                                                       target.device_size,
-                                                       0,
-                                                       nullptr,
-                                                       nullptr,
-                                                       &result);
-      opencl_assert_err(result, "clEnqueueMapBuffer");
-
-      for (int y = ymin; y < ymax; y++) {
-        float *target_row = target_data + pass_stride * target.offset + y * pass_stride * target.stride;
-        const float *data_row = data + (y - ymin + overlap_y) * rect_size.x * 3;
-
-        for (int x = xmin; x < xmax; x++) {
-          target_row[pass_stride * x + 0] = data_row[3 * (x - xmin + overlap_x) + 0] * invscale;
-          target_row[pass_stride * x + 1] = data_row[3 * (x - xmin + overlap_x) + 1] * invscale;
-          target_row[pass_stride * x + 2] = data_row[3 * (x - xmin + overlap_x) + 2] * invscale;
-        }
-      }
-      opencl_assert(
-          clEnqueueUnmapMemObject(cqCommandQueue, target_mem, target_data, 0, nullptr, nullptr));
-
-      check_result_rif_ret(rifImageUnmap(output_img, data));
-#else
-      cl_kernel filter_write_color = denoising_program(ustring("filter_write_color"));
-
-      int arg_ofs = 0;
-      arg_ofs += kernel_set_args(filter_write_color,
-                                 arg_ofs,
-                                 output.device_pointer,
-                                 pass_stride,
-                                 target.offset,
-                                 target.stride);
-
-      arg_ofs += kernel_set_args(filter_write_color, arg_ofs, target.buffer, rect_size.x, overlap_x, overlap_y);
-      arg_ofs += kernel_set_args(filter_write_color, arg_ofs, xmin, xmax, ymin, ymax, invscale);
-
-      enqueue_kernel(filter_write_color, size_t(xmax - xmin), size_t(ymax - ymin));
-#  endif
       task.unmap_neighbor_tiles(neighbors, this);
     }
     else {

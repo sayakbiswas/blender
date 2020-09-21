@@ -219,7 +219,6 @@ enum_denoising_input_passes = (
     ('RGB_ALBEDO_NORMAL', "Color + Albedo + Normal", "Use color, albedo and normal data as input", 3),
 )
 
-
 def update_render_passes(self, context):
     scene = context.scene
     view_layer = context.view_layer
@@ -833,6 +832,8 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
 
     debug_optix_cuda_streams: IntProperty(name="CUDA Streams", default=1, min=1)
     debug_optix_curves_api: BoolProperty(name="Native OptiX Curve Primitive", default=False)
+
+    debug_rif_color_only: BoolProperty(name="Color only denoising", default=True)
 
     debug_opencl_kernel_type: EnumProperty(
         name="OpenCL Kernel Type",
