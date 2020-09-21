@@ -68,9 +68,6 @@ CCL_NAMESPACE_BEGIN
 
 class RIFDevice : public OpenCLDevice {
 
-  // Use a pool with multiple threads to support launches with multiple OpenCL queues
-  TaskPool task_pool;
-
   template<typename T> class rif_object {
    private:
     T object = nullptr;
@@ -146,6 +143,7 @@ class RIFDevice : public OpenCLDevice {
     denoising_program.add_kernel(ustring("filter_write_color"));
     denoising_program.add_kernel(ustring("filter_split_aov"));
     denoising_program.add_kernel(ustring("filter_copy_input"));
+
     if (!denoising_program.load()) {
       denoising_program.compile();
     }
@@ -211,7 +209,6 @@ class RIFDevice : public OpenCLDevice {
   }
 
  private:
-
   void merge_tiles(DeviceTask &task,
                    const float scale,
                    RenderTileNeighbors &neighbors,
