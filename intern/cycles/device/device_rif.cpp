@@ -34,6 +34,7 @@
 #  include "util/util_path.h"
 #  include "util/util_time.h"
 
+#  include <delayimp.h>
 #  include <RadeonImageFilters.h>
 #  include <RadeonImageFilters_cl.h>
 
@@ -65,6 +66,20 @@ CCL_NAMESPACE_BEGIN
       } \
     } \
     (void)0
+
+HMODULE LoadRIFDll(LPCSTR moduleName)
+{
+  return LoadLibraryA("C:\Program Files\AMD\CNext\CNext\RadeonImageFilters.dll");
+}
+
+FARPROC WINAPI RIFDliNotifyHook(unsigned dliNotify, PDelayLoadInfo pdli)
+{
+  if (dliNotify == dliNotePreLoadLibrary)
+    return (FARPROC)LoadRIFDll(pdli->szDll);
+  return NULL;
+}
+
+extern "C" PfnDliHook __pfnDliNotifyHook2 = RIFDliNotifyHook;
 
 class RIFDevice : public OpenCLDevice {
 

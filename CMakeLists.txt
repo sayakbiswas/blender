@@ -1675,6 +1675,12 @@ if(WITH_BLENDER)
 endif()
 
 #-----------------------------------------------------------------------------
+# Use dynamic loading for RIF
+if(WITH_CYCLES_DEVICE_RIF)
+  rif_delayload(blender)
+endif()
+
+#-----------------------------------------------------------------------------
 # Print Final Configuration
 
 if(FIRST_RUN)
