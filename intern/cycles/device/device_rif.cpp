@@ -38,6 +38,8 @@
 #  include <RadeonImageFilters.h>
 #  include <RadeonImageFilters_cl.h>
 
+#  pragma comment(lib, "delayimp")
+
 #  define RIF_DENOISER_NO_PIXEL_STRIDE 1
 
 CCL_NAMESPACE_BEGIN
@@ -69,7 +71,7 @@ CCL_NAMESPACE_BEGIN
 
 HMODULE LoadRIFDll(LPCSTR moduleName)
 {
-  return LoadLibraryA("C:\Program Files\AMD\CNext\CNext\RadeonImageFilters.dll");
+  return LoadLibraryA("C:/Program Files/AMD/CNext/CNext/RadeonImageFilters.dll");
 }
 
 FARPROC WINAPI RIFDliNotifyHook(unsigned dliNotify, PDelayLoadInfo pdli)
